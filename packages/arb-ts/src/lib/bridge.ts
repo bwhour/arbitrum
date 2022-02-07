@@ -38,6 +38,10 @@ import { L1WethGateway__factory } from './abi/factories/L1WethGateway__factory'
 import { Inbox__factory } from './abi/factories/Inbox__factory'
 import { Bridge__factory } from './abi/factories/Bridge__factory'
 import { OldOutbox__factory } from './abi/factories/OldOutbox__factory'
+import { ERC20__factory } from './abi/factories/ERC20__factory'
+import { L1ERC20Gateway } from './abi/L1ERC20Gateway'
+import { L1GatewayRouter } from './abi/L1GatewayRouter'
+import { ERC20 } from './abi/ERC20'
 
 import { Await, DepositParams, L1Bridge, L1TokenData } from './l1Bridge'
 import { L2Bridge, L2TokenData } from './l2Bridge'
@@ -53,15 +57,8 @@ import {
 } from './bridge_helpers'
 import { NODE_INTERFACE_ADDRESS } from './precompile_addresses'
 import networks, { Network } from './networks'
-import {
-  L1ERC20Gateway,
-  L1GatewayRouter,
-  Multicall2__factory,
-  ArbMulticall2__factory,
-  ERC20__factory,
-  ERC20,
-} from './abi'
-import { Result } from '@ethersproject/abi'
+import { hexDataLength } from '@ethersproject/bytes'
+
 interface RetryableGasArgs {
   maxSubmissionPrice?: BigNumber
   maxGas?: BigNumber
@@ -94,6 +91,13 @@ function isError(error: Error): error is NodeJS.ErrnoException {
 const DEFAULT_SUBMISSION_PERCENT_INCREASE = BigNumber.from(400)
 const DEFAULT_MAX_GAS_PERCENT_INCREASE = BigNumber.from(50)
 const MIN_CUSTOM_DEPOSIT_MAXGAS = BigNumber.from(275000)
+
+interface RetryableParamsOptions {
+  maxSubmissionFeePercentIncrease?: BigNumber
+  maxGasPercentIncrease?: BigNumber
+  maxGasPricePercentIncrease?: BigNumber
+  includeL2Callvalue?: boolean
+}
 
 /**
  * Main class for accessing token bridge methods; inherits methods from {@link L1Bridge} and {@link L2Bridge}
@@ -245,6 +249,75 @@ export class Bridge {
       } else {
         throw err
       }
+    }
+  }
+
+  public async getRetryableTxnParams(
+    callDataHex: string,
+    sender: string,
+    destinationAddress: string,
+    _l2CallValue?: BigNumber,
+    options: RetryableParamsOptions = {}
+  ) {
+    const maxGasPriceIncrease =
+      options.maxGasPricePercentIncrease || BigNumber.from(0)
+    const maxGasIncrease = options.maxGasPercentIncrease || BigNumber.from(0)
+    const maxSubmissionFeeIncrease =
+      options.maxSubmissionFeePercentIncrease ||
+      DEFAULT_SUBMISSION_PERCENT_INCREASE
+    const l2CallValue = _l2CallValue || BigNumber.from(0)
+
+    const includeL2Callvalue =
+      typeof options.includeL2Callvalue === 'boolean'
+        ? options.includeL2Callvalue
+        : true
+
+    const gasPriceBid = BridgeHelper.percentIncrease(
+      await this.l2Provider.getGasPrice(),
+      maxGasPriceIncrease
+    )
+
+    const submissionPrice = (
+      await this.l2Bridge.getTxnSubmissionPrice(hexDataLength(callDataHex))
+    )[0]
+    const submissionPriceBid = BridgeHelper.percentIncrease(
+      submissionPrice,
+      maxSubmissionFeeIncrease
+    )
+
+    const nodeInterface = NodeInterface__factory.connect(
+      NODE_INTERFACE_ADDRESS,
+      this.l2Provider
+    )
+
+    const maxGas = (
+      await nodeInterface.estimateRetryableTicket(
+        sender,
+        parseEther('1').add(
+          l2CallValue
+        ) /** we add a 1 ether "deposit" buffer to pay for execution in the gas estimation  */,
+        destinationAddress,
+        l2CallValue,
+        submissionPriceBid,
+        sender,
+        sender,
+        0,
+        gasPriceBid,
+        callDataHex
+      )
+    )[0]
+
+    const maxGasBid = BridgeHelper.percentIncrease(maxGas, maxGasIncrease)
+
+    let totalDepositValue = submissionPriceBid.add(gasPriceBid.mul(maxGas))
+    if (includeL2Callvalue) {
+      totalDepositValue = totalDepositValue.add(l2CallValue)
+    }
+    return {
+      gasPriceBid,
+      submissionPriceBid,
+      maxGasBid,
+      totalDepositValue,
     }
   }
 

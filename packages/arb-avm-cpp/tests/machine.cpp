@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2020, Offchain Labs, Inc.
+ * Copyright 2019-2021, Offchain Labs, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -70,7 +70,7 @@ TEST_CASE("Checkpoint State") {
     DBDeleter deleter;
     ArbCoreConfig coreConfig{};
     ArbStorage storage(dbpath, coreConfig);
-    REQUIRE(storage.initialize(test_contract_path).ok());
+    REQUIRE(storage.initialize(test_contract_path).status.ok());
     ValueCache value_cache{1, 0};
 
     auto machine = storage.getInitialMachine();
@@ -95,7 +95,7 @@ TEST_CASE("Delete machine checkpoint") {
     DBDeleter deleter;
     ArbCoreConfig coreConfig{};
     ArbStorage storage(dbpath, coreConfig);
-    REQUIRE(storage.initialize(test_contract_path).ok());
+    REQUIRE(storage.initialize(test_contract_path).status.ok());
 
     SECTION("default") {
         auto machine = storage.getInitialMachine();
@@ -118,7 +118,7 @@ TEST_CASE("Restore checkpoint") {
     DBDeleter deleter;
     ArbCoreConfig coreConfig{};
     ArbStorage storage(dbpath, coreConfig);
-    REQUIRE(storage.initialize(test_contract_path).ok());
+    REQUIRE(storage.initialize(test_contract_path).status.ok());
     ValueCache value_cache{1, 0};
 
     SECTION("default") {
@@ -222,7 +222,7 @@ TEST_CASE("Stopping on sideload") {
     MachineExecutionConfig execConfig;
 
     // First, test running straight past the sideload
-    Machine machine = orig_machine;
+    Machine machine{orig_machine};
     machine.machine_state.context = AssertionContext(execConfig);
     auto assertion = machine.run();
     REQUIRE(machine.currentStatus() == Status::Error);
@@ -233,6 +233,7 @@ TEST_CASE("Stopping on sideload") {
     machine = orig_machine;
     execConfig.sideloads.emplace_back(InboxMessage());
     execConfig.stop_on_sideload = true;  // Shouldn't matter
+    execConfig.stop_on_breakpoint = false;
     machine.machine_state.context = AssertionContext(execConfig);
     assertion = machine.run();
     REQUIRE(machine.currentStatus() == Status::Halted);
@@ -243,6 +244,7 @@ TEST_CASE("Stopping on sideload") {
     machine = orig_machine;
     execConfig.sideloads.clear();
     execConfig.stop_on_sideload = true;
+    execConfig.stop_on_breakpoint = false;
     machine.machine_state.context = AssertionContext(execConfig);
     assertion = machine.run();
     REQUIRE(machine.currentStatus() == Status::Extensive);

@@ -137,7 +137,7 @@ TEST_CASE("ArbCore tests") {
         INFO("Testing " << filename);
 
         ArbStorage storage1(dbpath, coreConfig);
-        REQUIRE(storage1.initialize(arb_os_path).ok());
+        REQUIRE(storage1.initialize(arb_os_path).status.ok());
         auto arbCore1 = storage1.getArbCore();
         REQUIRE(arbCore1->startThread());
 
@@ -150,7 +150,7 @@ TEST_CASE("ArbCore tests") {
 
         std::vector<Tuple> inbox_message_tuples;
         for (auto& json_message : j.at("inbox")) {
-            auto tup = std::get<Tuple>(simple_value_from_json(json_message));
+            auto tup = get<Tuple>(simple_value_from_json(json_message));
             inbox_message_tuples.push_back(std::move(tup));
         }
 
@@ -161,7 +161,7 @@ TEST_CASE("ArbCore tests") {
         }
 
         auto logs_json = j.at("logs");
-        std::vector<value> logs;
+        std::vector<Value> logs;
         for (auto& log_json : logs_json) {
             logs.push_back(simple_value_from_json(log_json));
         }
@@ -242,7 +242,7 @@ TEST_CASE("ArbCore tests") {
         // Create a new arbCore and verify it gets to the same point
         storage1.closeArbStorage();
         ArbStorage storage2(dbpath, coreConfig);
-        REQUIRE(storage2.initialize(arb_os_path).ok());
+        REQUIRE(storage2.initialize(arb_os_path).status.ok());
         auto arbCore2 = storage2.getArbCore();
         logs_count = uint64_t(arbCore2->getLastMachineOutput().log_count);
         if (!sends.empty()) {
@@ -258,7 +258,7 @@ TEST_CASE("ArbCore tests") {
         while (arbCore2->getLastMachineOutput().arb_gas_used <
                final_output.arb_gas_used) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            REQUIRE(n++ < 100);
+            REQUIRE(n++ < 1000);
         }
         REQUIRE(arbCore2->getLastMachineOutput() == final_output);
     }
@@ -300,7 +300,7 @@ TEST_CASE("ArbCore inbox") {
     ArbStorage storage(dbpath, coreConfig);
     REQUIRE(
         storage.initialize(std::string{machine_test_cases_path} + "/inbox.mexe")
-            .ok());
+            .status.ok());
     auto arbCore = storage.getArbCore();
     REQUIRE(arbCore->startThread());
 
@@ -343,7 +343,7 @@ TEST_CASE("ArbCore backwards reorg") {
     ArbStorage storage(dbpath, coreConfig);
     REQUIRE(
         storage.initialize(std::string{machine_test_cases_path} + "/inbox.mexe")
-            .ok());
+            .status.ok());
     auto arbCore = storage.getArbCore();
     REQUIRE(arbCore->startThread());
 
@@ -396,7 +396,7 @@ TEST_CASE("ArbCore duplicate code segments") {
     REQUIRE(storage
                 .initialize(std::string{machine_test_cases_path} +
                             "/dupsegments.mexe")
-                .ok());
+                .status.ok());
     auto arbCore = storage.getArbCore();
     REQUIRE(arbCore->startThread());
 
@@ -405,7 +405,8 @@ TEST_CASE("ArbCore duplicate code segments") {
     std::vector<InboxMessage> messages;
     messages.reserve(CHECKPOINTS);
     for (int i = 0; i < CHECKPOINTS; i++) {
-        messages.push_back(InboxMessage(0, {}, 0, 0, i, 0, {}));
+        messages.push_back(
+            InboxMessage(0, {}, 0, std::time(nullptr), i, 0, {}));
     }
     auto batch = buildBatch(messages);
     REQUIRE(batch.size() == CHECKPOINTS);
@@ -436,7 +437,7 @@ TEST_CASE("ArbCore duplicate code segments") {
             REQUIRE(storage
                         .initialize(std::string{machine_test_cases_path} +
                                     "/dupsegments.mexe")
-                        .ok());
+                        .status.ok());
             arbCore = storage.getArbCore();
             REQUIRE(arbCore->startThread());
         }
@@ -446,4 +447,80 @@ TEST_CASE("ArbCore duplicate code segments") {
     REQUIRE(cursor.status.ok());
     REQUIRE(std::get<std::unique_ptr<Machine>>(cursor.data->machine)
                 ->currentStatus() == Status::Halted);
+}
+
+TEST_CASE("ArbCore code segment reorg") {
+    DBDeleter deleter;
+
+    ArbCoreConfig coreConfig{};
+    coreConfig.checkpoint_gas_frequency = 100;
+    ArbStorage storage(dbpath, coreConfig);
+    REQUIRE(storage
+                .initialize(std::string{machine_test_cases_path} +
+                            "/segmentreorg.mexe")
+                .status.ok());
+    auto arbCore = storage.getArbCore();
+    REQUIRE(arbCore->startThread());
+
+    std::vector<InboxMessage> messages;
+    for (size_t i = 0; i < 2; i++) {
+        messages.push_back(
+            InboxMessage(0, {}, 0, std::time(nullptr), i, 0, {}));
+    }
+    auto batch = buildBatch(messages);
+    REQUIRE(batch.size() == 2);
+    std::vector<std::vector<unsigned char>> rawSeqBatchItems(
+        1, serializeForCore(batch[0]));
+    REQUIRE(arbCore->deliverMessages(0, 0, rawSeqBatchItems,
+                                     std::vector<std::vector<unsigned char>>(),
+                                     std::nullopt));
+    waitForDelivery(arbCore);
+    auto inbox_acc = batch[0].accumulator;
+
+    size_t tries = 0;
+    while (!arbCore->machineIdle() ||
+           arbCore->getLastMachineOutput().l2_block_number != 1) {
+        REQUIRE(tries++ < 100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Deliver the second message
+    rawSeqBatchItems[0] = serializeForCore(batch[1]);
+    REQUIRE(arbCore->deliverMessages(1, inbox_acc, rawSeqBatchItems,
+                                     std::vector<std::vector<unsigned char>>(),
+                                     std::nullopt));
+    waitForDelivery(arbCore);
+
+    tries = 0;
+    while (!arbCore->machineIdle() ||
+           arbCore->getLastMachineOutput().l2_block_number != 2) {
+        REQUIRE(tries++ < 100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Reorg to the first message then re-add the second message
+    REQUIRE(arbCore->deliverMessages(
+        0, 0, std::vector<std::vector<unsigned char>>(),
+        std::vector<std::vector<unsigned char>>(), 1));
+    waitForDelivery(arbCore);
+
+    tries = 0;
+    while (!arbCore->machineIdle() ||
+           arbCore->getLastMachineOutput().l2_block_number != 1) {
+        REQUIRE(tries++ < 100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Redeliver the second message
+    REQUIRE(arbCore->deliverMessages(1, inbox_acc, rawSeqBatchItems,
+                                     std::vector<std::vector<unsigned char>>(),
+                                     std::nullopt));
+    waitForDelivery(arbCore);
+
+    tries = 0;
+    while (!arbCore->machineIdle() ||
+           arbCore->getLastMachineOutput().l2_block_number != 2) {
+        REQUIRE(tries++ < 100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }

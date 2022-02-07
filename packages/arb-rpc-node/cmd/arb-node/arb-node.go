@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	golog "log"
 	"math/big"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/pkg/errors"
 
 	"github.com/rs/zerolog"
@@ -53,6 +55,12 @@ var logger zerolog.Logger
 var pprofMux *http.ServeMux
 
 const largeChannelBuffer = 200
+
+const (
+	failLimit            = 6
+	checkFrequency       = time.Second * 30
+	blockCheckCountDelay = 5
+)
 
 func init() {
 	pprofMux = http.DefaultServeMux
@@ -99,6 +107,10 @@ func startup() error {
 		}
 
 		return nil
+	}
+
+	if config.Core.Test.JustMetadata {
+		return cmdhelp.PrintDatabaseMetadata(config.GetNodeDatabasePath(), &config.Core)
 	}
 
 	badConfig := false
@@ -214,17 +226,27 @@ func startup() error {
 
 	var sequencerFeed chan broadcaster.BroadcastFeedMessage
 	if len(config.Feed.Input.URLs) == 0 {
-		logger.Warn().Msg("Missing --feed.url so not subscribing to feed")
+		logger.Warn().Msg("Missing --feed.input.url so not subscribing to feed")
 	} else {
-		sequencerFeed = make(chan broadcaster.BroadcastFeedMessage, 1)
+		sequencerFeed = make(chan broadcaster.BroadcastFeedMessage, 4096)
 		for _, url := range config.Feed.Input.URLs {
 			broadcastClient := broadcastclient.NewBroadcastClient(url, nil, config.Feed.Input.Timeout)
 			broadcastClient.ConnectInBackground(ctx, sequencerFeed)
 		}
 	}
+
 	var inboxReader *monitor.InboxReader
 	for {
-		inboxReader, err = mon.StartInboxReader(ctx, l1Client, common.HexToAddress(config.Rollup.Address), config.Rollup.FromBlock, common.HexToAddress(config.BridgeUtilsAddress), healthChan, sequencerFeed, config.Node.ParanoidInboxReader)
+		inboxReader, err = mon.StartInboxReader(
+			ctx,
+			l1Client,
+			common.HexToAddress(config.Rollup.Address),
+			config.Rollup.FromBlock,
+			common.HexToAddress(config.BridgeUtilsAddress),
+			healthChan,
+			sequencerFeed,
+			config.Node.InboxReader,
+		)
 		if err == nil {
 			break
 		}
@@ -254,7 +276,11 @@ func startup() error {
 			return errors.Wrap(err, "error running GetKeystore")
 		}
 
-		logger.Info().Hex("from", auth.From.Bytes()).Msg("Arbitrum node submitting batches")
+		if config.Node.Sequencer.Dangerous.DisableBatchPosting {
+			logger.Info().Hex("from", auth.From.Bytes()).Msg("Arbitrum node with disabled batch posting")
+		} else {
+			logger.Info().Hex("from", auth.From.Bytes()).Msg("Arbitrum node submitting batches")
+		}
 
 		if err := ethbridge.WaitForBalance(
 			ctx,
@@ -339,7 +365,12 @@ func startup() error {
 	}
 
 	srv := aggregator.NewServer(batch, rollupAddress, l2ChainId, db)
-	web3Server, err := web3.GenerateWeb3Server(srv, nil, rpcMode, nil, web3InboxReaderRef)
+	serverConfig := web3.ServerConfig{
+		Mode:          rpcMode,
+		MaxCallAVMGas: config.Node.RPC.MaxCallGas * 100, // Multiply by 100 for arb gas to avm gas conversion
+		DevopsStubs:   config.Node.RPC.EnableDevopsStubs,
+	}
+	web3Server, err := web3.GenerateWeb3Server(srv, nil, serverConfig, nil, web3InboxReaderRef)
 	if err != nil {
 		return err
 	}
@@ -350,6 +381,45 @@ func startup() error {
 		}
 	}()
 
+	if config.Node.Type == "forwarder" && config.Node.Forwarder.Target != "" {
+		go func() {
+			clnt, err := ethclient.DialContext(ctx, config.Node.Forwarder.Target)
+			if err != nil {
+				log.Warn().Err(err).Msg("failed to connect to forward target")
+				clnt = nil
+			}
+			failCount := 0
+			for {
+				valid, err := checkBlockHash(ctx, clnt, db)
+				if err != nil {
+					log.Warn().Err(err).Msg("failed to lookup blockhash for consistency check")
+					clnt, err = ethclient.DialContext(ctx, config.Node.Forwarder.Target)
+					if err != nil {
+						log.Warn().Err(err).Msg("failed to connect to forward target")
+						clnt = nil
+					}
+				} else {
+					if !valid {
+						failCount++
+					} else {
+						failCount = 0
+					}
+				}
+				if failCount >= failLimit {
+					log.Error().Msg("exiting due to repeated block hash mismatches")
+					cancelFunc()
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(checkFrequency):
+				}
+			}
+		}()
+
+	}
+
 	select {
 	case err := <-txDBErrChan:
 		return err
@@ -358,4 +428,34 @@ func startup() error {
 	case <-cancelChan:
 		return nil
 	}
+}
+
+func checkBlockHash(ctx context.Context, clnt *ethclient.Client, db *txdb.TxDB) (bool, error) {
+	if clnt == nil {
+		return false, errors.New("need a client to check block hash")
+	}
+	blockCount, err := db.BlockCount()
+	if err != nil {
+		return false, err
+	}
+	if blockCount < blockCheckCountDelay {
+		return true, nil
+	}
+	// Use a small block delay here in case the upstream node isn't full caught up
+	block, err := db.GetBlock(blockCount - blockCheckCountDelay)
+	if err != nil {
+		return false, err
+	}
+	remoteHeader, err := clnt.HeaderByNumber(ctx, block.Header.Number)
+	if err != nil {
+		return false, err
+	}
+	if remoteHeader.Hash() == block.Header.Hash() {
+		return true, nil
+	}
+	logger.Warn().
+		Str("remote", remoteHeader.Hash().Hex()).
+		Str("local", block.Header.Hash().Hex()).
+		Msg("mismatched block header")
+	return false, nil
 }

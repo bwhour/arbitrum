@@ -50,6 +50,11 @@ struct Slice;
 class ColumnFamilyHandle;
 }  // namespace rocksdb
 
+struct InitializeResult {
+    rocksdb::Status status;
+    bool finished;
+};
+
 struct RawMessageInfo {
     std::vector<unsigned char> message;
     uint256_t sequence_number;
@@ -74,8 +79,8 @@ class ArbCore {
 
     struct logscursor_logs {
         uint256_t first_log_index;
-        std::vector<MachineEmission<value>> logs;
-        std::vector<MachineEmission<value>> deleted_logs;
+        std::vector<MachineEmission<Value>> logs;
+        std::vector<MachineEmission<Value>> deleted_logs;
     };
 
    private:
@@ -96,20 +101,11 @@ class ArbCore {
     std::atomic<bool> arbcore_abort{false};
 
     // Core thread input
-    std::atomic<bool> save_checkpoint{false};
-    rocksdb::Status save_checkpoint_status;
+    std::mutex checkpoint_pruning_mutex;
+    uint256_t unsafe_checkpoint_pruning_gas_used;
 
-    // Core thread input for cleaning up old checkpoints
-    // Delete_checkpoints_before message should be set to non-zero value
-    // after other parameters are set.  Main thread will set
-    // delete_checkpoints_before_message to zero once cleanup has finished.
-    std::atomic<uint256_t> delete_checkpoints_before_message{0};
-    // If save_checkpoint_message_interval is zero, all checkpoints after
-    // delete_checkpoints_before_message are deleted.  If non-zero, only
-    // the last checkpoint for each message interval is saved.
-    uint256_t save_checkpoint_message_interval{0};
-    // Do not delete any checkpoints after ignore_checkpoints_after_message
-    uint256_t ignore_checkpoints_after_message{0};
+    // Core thread input
+    std::atomic<bool> trigger_save_rocksdb_checkpoint{false};
 
     // Core thread holds mutex only during reorg.
     // Routines accessing database for log entries will need to acquire mutex
@@ -157,11 +153,17 @@ class ArbCore {
             ArbCoreConfig coreConfig);
 
     ~ArbCore() { abortThread(); }
-    rocksdb::Status initialize(const LoadedExecutable& executable);
+    void printDatabaseMetadata();
+    InitializeResult initialize(const LoadedExecutable& executable);
     [[nodiscard]] bool initialized() const;
     void operator()();
 
     void printCoreThreadBacktrace();
+
+   private:
+    rocksdb::Status initializePruningMode(
+        bool database_exists,
+        ValueResult<std::string>& pruning_mode_result);
 
    public:
     // Public Thread interaction
@@ -174,6 +176,9 @@ class ArbCore {
         ReadTransaction& tx) const;
     rocksdb::Status updateSchemaVersion(ReadWriteTransaction& tx,
                                         const uint256_t& schema_version);
+    ValueResult<std::string> pruningMode(ReadTransaction& tx) const;
+    rocksdb::Status updatePruningMode(ReadWriteTransaction& tx,
+                                      const std::string& pruning_mode);
     rocksdb::Status saveAssertion(ReadWriteTransaction& tx,
                                   const Assertion& assertion,
                                   uint256_t arb_gas_used);
@@ -201,17 +206,18 @@ class ArbCore {
         bool initial_start,
         ValueCache& value_cache);
 
-    rocksdb::Status reorgToMachineOutput(const MachineOutput& output,
-                                         ValueCache& value_cache);
+    rocksdb::Status reorgDatabaseToMachineOutput(const MachineOutput& output,
+                                                 ValueCache& value_cache);
     rocksdb::Status advanceCoreToTarget(const MachineOutput& target_output,
                                         bool cache_sideloads);
-    std::variant<MachineOutput, rocksdb::Status> reorgToFirstMatchingCheckpoint(
+    std::variant<CheckpointVariant, rocksdb::Status>
+    reorgToLastMatchingCheckpoint(
         const std::function<bool(const MachineOutput&)>& check_output,
         ReadWriteTransaction& tx,
         std::unique_ptr<rocksdb::Iterator>& checkpoint_it);
     std::variant<std::unique_ptr<MachineThread>, rocksdb::Status>
-    reorgToFirstMatchingMachineCheckpoint(
-        const MachineOutput& target_machine_output,
+    loadLastMatchingMachine(
+        const CheckpointVariant& last_matching_database_checkpoint,
         const std::function<bool(const MachineOutput&)>& check_output,
         ReadWriteTransaction& tx,
         std::unique_ptr<rocksdb::Iterator>& checkpoint_it,
@@ -224,13 +230,17 @@ class ArbCore {
         ValueCache& value_cache,
         bool lazy_load) const;
 
-    ValueLoader makeValueLoader() const;
+    [[nodiscard]] ValueLoader makeValueLoader() const;
 
    public:
     // To be deprecated, use checkpoints instead
     template <class T>
     std::unique_ptr<T> getMachine(uint256_t machineHash,
                                   ValueCache& value_cache);
+
+   public:
+    // To trigger saving database copy
+    void triggerSaveFullRocksdbCheckpointToDisk();
 
    private:
     template <class T>
@@ -241,13 +251,19 @@ class ArbCore {
     rocksdb::Status saveCheckpoint(ReadWriteTransaction& tx);
     void deleteCheckpoint(ReadWriteTransaction& tx,
                           const CheckpointVariant& checkpoint_variant);
+    std::unique_ptr<MachineThread> getMachineThreadFromCheckpoint(
+        const CheckpointVariant& current_database_checkpoint,
+        const std::function<bool(const MachineOutput&)>& check_output,
+        ReadWriteTransaction& tx,
+        ValueCache& value_cache);
 
    public:
     // Useful for unit tests
-    // Do not call triggerSaveCheckpoint from multiple threads at the same time
-    rocksdb::Status triggerSaveCheckpoint();
-    bool isCheckpointsEmpty(ReadTransaction& tx) const;
     uint256_t maxCheckpointGas();
+
+   public:
+    // Controlling checkpoint pruning
+    void updateCheckpointPruningGas(uint256_t gas);
 
    public:
     // Managing machine state
@@ -323,7 +339,7 @@ class ArbCore {
     [[nodiscard]] ValueResult<uint256_t> delayedMessageEntryInsertedCount()
         const;
     [[nodiscard]] ValueResult<uint256_t> totalDelayedMessagesSequenced() const;
-    ValueResult<std::vector<MachineEmission<value>>>
+    ValueResult<std::vector<MachineEmission<Value>>>
     getLogs(uint256_t index, uint256_t count, ValueCache& valueCache);
     [[nodiscard]] ValueResult<std::vector<std::vector<unsigned char>>> getSends(
         uint256_t index,
@@ -368,15 +384,9 @@ class ArbCore {
     [[nodiscard]] ValueResult<uint256_t> logInsertedCountImpl(
         const ReadTransaction& tx) const;
 
-    ValueResult<uint256_t> logProcessedCount(ReadTransaction& tx) const;
-    rocksdb::Status updateLogProcessedCount(ReadWriteTransaction& tx,
-                                            rocksdb::Slice value_slice);
     [[nodiscard]] ValueResult<uint256_t> sendInsertedCountImpl(
         const ReadTransaction& tx) const;
 
-    ValueResult<uint256_t> sendProcessedCount(ReadTransaction& tx) const;
-    rocksdb::Status updateSendProcessedCount(ReadWriteTransaction& tx,
-                                             rocksdb::Slice value_slice);
     [[nodiscard]] ValueResult<uint256_t> messageEntryInsertedCountImpl(
         const ReadTransaction& tx) const;
     [[nodiscard]] ValueResult<uint256_t> delayedMessageEntryInsertedCountImpl(
@@ -385,7 +395,7 @@ class ArbCore {
         const ReadTransaction& tx) const;
 
     rocksdb::Status saveLogs(ReadWriteTransaction& tx,
-                             const std::vector<MachineEmission<value>>& val);
+                             const std::vector<MachineEmission<Value>>& val);
     rocksdb::Status saveSends(
         ReadWriteTransaction& tx,
         const std::vector<MachineEmission<std::vector<unsigned char>>>& sends);
@@ -394,7 +404,7 @@ class ArbCore {
     ValueResult<std::optional<uint256_t>> addMessages(
         const message_data_struct& data,
         ValueCache& cache);
-    ValueResult<std::vector<MachineEmission<value>>> getLogsNoLock(
+    ValueResult<std::vector<MachineEmission<Value>>> getLogsNoLock(
         ReadTransaction& tx,
         uint256_t index,
         uint256_t count,
@@ -447,11 +457,32 @@ class ArbCore {
     [[nodiscard]] ValueResult<uint256_t> logsCursorGetCurrentTotalCount(
         const ReadTransaction& tx,
         size_t cursor_index) const;
+    rocksdb::Status pruneCheckpoints(
+        const std::function<bool(const MachineOutput&)>& check_output,
+        uint64_t checkpoint_max_to_prune);
+    rocksdb::Status pruneToTimestampOrBefore(const uint256_t& timestamp,
+                                             uint64_t checkpoint_max_to_prune);
+    rocksdb::Status pruneToGasOrBefore(const uint256_t& gas,
+                                       uint64_t checkpoint_max_to_prune);
+
+   private:
+    void printElapsed(
+        const std::chrono::time_point<std::chrono::steady_clock>& begin_time,
+        const std::chrono::time_point<std::chrono::steady_clock>& end_time,
+        const std::string& message) const;
+    void printMachineOutputInfo(const std::string& msg,
+                                MachineOutput& machine_output) const;
+    std::variant<rocksdb::Status, CheckpointVariant> getMaxCheckpoint(
+        ReadTransaction& tx);
+    std::unique_ptr<MachineThread> getMachineThreadFromSimpleCheck(
+        const std::function<bool(const MachineOutput&)>& check_output);
 };
 
 uint64_t seconds_since_epoch();
 
 std::optional<rocksdb::Status> deleteLogsStartingAt(ReadWriteTransaction& tx,
                                                     uint256_t log_index);
+
+std::string optionalUint256ToString(std::optional<uint256_t>& value);
 
 #endif /* arbcore_hpp */

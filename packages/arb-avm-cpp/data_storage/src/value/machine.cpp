@@ -282,6 +282,11 @@ std::pair<rocksdb::Status, std::map<uint64_t, uint64_t>> saveMachineState(
     return {rocksdb::Status::OK(), std::move(segment_counts)};
 }
 
+void saveCodeToCore(Machine& machine,
+                    const std::map<uint64_t, uint64_t>& segment_counts) {
+    machine.machine_state.code->commitCodeToCore(segment_counts);
+}
+
 SaveResults saveTestMachine(ReadWriteTransaction& transaction,
                             Machine& machine) {
     std::vector<unsigned char> checkpoint_name;
@@ -301,13 +306,15 @@ SaveResults saveTestMachine(ReadWriteTransaction& transaction,
     if (!machine_save_res.first.ok()) {
         return {0, machine_save_res.first};
     }
-    auto machine_code =
-        dynamic_cast<RunningCode*>(machine.machine_state.code.get());
-    assert(machine_code != nullptr);
-    auto parent_code = machine_code->getParent();
+    saveCodeToCore(machine, machine_save_res.second);
 
-    machine_code->commitCodeToParent(machine_save_res.second);
-    machine.machine_state.code = std::make_shared<RunningCode>(parent_code);
+    auto& core_code = machine.machine_state.code;
+    while (std::dynamic_pointer_cast<RunningCode>(core_code).get() != nullptr) {
+        core_code =
+            std::dynamic_pointer_cast<RunningCode>(core_code)->getParent();
+    }
+    machine.machine_state.code = std::make_shared<RunningCode>(core_code);
+
     std::vector<unsigned char> serialized_state;
     serializeMachineStateKeys(MachineStateKeys(machine.machine_state),
                               serialized_state);

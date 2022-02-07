@@ -56,10 +56,11 @@ struct AssertionContext {
     std::vector<MachineMessage> inbox_messages;
 
     std::vector<MachineEmission<std::vector<uint8_t>>> sends;
-    std::vector<MachineEmission<value>> logs;
-    std::vector<MachineEmission<value>> debug_prints;
+    std::vector<MachineEmission<Value>> logs;
+    std::vector<MachineEmission<Value>> debug_prints;
     std::deque<InboxMessage> sideloads;
     bool stop_on_sideload{false};
+    bool stop_on_breakpoint{false};
     uint256_t max_gas;
     bool go_over_gas{false};
     bool first_instruction{true};
@@ -78,12 +79,6 @@ struct AssertionContext {
         return inbox_messages[inbox_messages_consumed++];
     }
 
-    // peekInbox assumes that the number of messages already consumed is less
-    // than the number of messages in the inbox
-    [[nodiscard]] const MachineMessage& peekInbox() const {
-        return inbox_messages[inbox_messages_consumed];
-    }
-
     [[nodiscard]] bool inboxEmpty() const {
         return inbox_messages_consumed >= inbox_messages.size();
     }
@@ -93,6 +88,11 @@ struct AssertionContext {
         logs.clear();
         debug_prints.clear();
         first_instruction = true;
+    }
+
+    void clearInboxMessages() {
+        inbox_messages.clear();
+        inbox_messages_consumed = 0;
     }
 };
 
@@ -162,8 +162,8 @@ struct MachineState {
     std::shared_ptr<Code> code;
     ValueLoader value_loader;
     mutable std::optional<CodeSegmentSnapshot> loaded_segment;
-    value registerVal;
-    value static_val;
+    Value registerVal;
+    Value static_val;
     Datastack stack;
     Datastack auxstack;
     uint256_t arb_gas_remaining;
@@ -176,14 +176,14 @@ struct MachineState {
 
     MachineState();
 
-    MachineState(std::shared_ptr<CoreCode> code_, value static_val);
+    MachineState(std::shared_ptr<CoreCode> code_, Value static_val);
 
     MachineState(MachineOutput output_,
                  CodePointRef pc_,
                  std::shared_ptr<Code> code_,
                  ValueLoader value_loader_,
-                 value register_val_,
-                 value static_val,
+                 Value register_val_,
+                 Value static_val,
                  Datastack stack_,
                  Datastack auxstack_,
                  uint256_t arb_gas_remaining_,
@@ -206,7 +206,7 @@ struct MachineState {
 
     void addProcessedMessage(const MachineMessage& message);
     void addProcessedSend(std::vector<uint8_t> data);
-    void addProcessedLog(value log_val);
+    void addProcessedLog(Value log_val);
 
    private:
     void marshalBufferProof(OneStepProof& proof) const;

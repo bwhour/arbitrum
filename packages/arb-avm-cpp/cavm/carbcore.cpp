@@ -51,6 +51,11 @@ int arbCoreMachineIdle(CArbCore* arbcore_ptr) {
     return arb_core->machineIdle();
 }
 
+void arbCoreSaveRocksdbCheckpoint(CArbCore* arbcore_ptr) {
+    auto arb_core = static_cast<ArbCore*>(arbcore_ptr);
+    arb_core->triggerSaveFullRocksdbCheckpointToDisk();
+}
+
 void* arbCoreMachineMessagesRead(CArbCore* arbcore_ptr) {
     auto arb_core = static_cast<ArbCore*>(arbcore_ptr);
     return returnUint256(arb_core->machineMessagesRead());
@@ -350,7 +355,7 @@ int arbCoreCountMatchingBatchAccs(CArbCore* arbcore_ptr, ByteSlice data) {
         if (!result.status.ok()) {
             return -1;
         }
-        return static_cast<int64_t>(result.data);
+        return static_cast<int>(result.data);
     } catch (const std::exception& e) {
         return -1;
     }
@@ -554,6 +559,13 @@ Uint256Result arbCoreGetLastMachineTotalGas(CArbCore* arbcore_ptr) {
     auto arbCore = static_cast<ArbCore*>(arbcore_ptr);
     auto gas = arbCore->getLastMachineOutput().arb_gas_used;
     return returnUint256Result({rocksdb::Status::OK(), gas});
+}
+
+void arbCoreUpdateCheckpointPruningGas(CArbCore* arbcore_ptr,
+                                       const void* gas_ptr) {
+    auto arbCore = static_cast<ArbCore*>(arbcore_ptr);
+    auto gas = receiveUint256(gas_ptr);
+    arbCore->updateCheckpointPruningGas(gas);
 }
 
 CMachine* arbCoreTakeMachine(CArbCore* arbcore_ptr,

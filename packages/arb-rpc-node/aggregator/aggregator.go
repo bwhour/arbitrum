@@ -104,7 +104,7 @@ func (m *Server) LatestBlockHeader() (*types.Header, error) {
 	return latest.Header, nil
 }
 
-// GetMessageResult returns the value output by the VM in response to the
+// GetRequestResult returns the value output by the VM in response to the
 // l2message with the given hash
 func (m *Server) GetRequestResult(requestId common.Hash) (*evm.TxResult, core.InboxState, error) {
 	return m.db.GetRequest(requestId)
@@ -160,21 +160,21 @@ func (m *Server) GetTxInBlockAtIndexResults(res *machine.BlockInfo, index uint64
 	return evmRes, nil
 }
 
-func (m *Server) GetSnapshot(blockHeight uint64) (*snapshot.Snapshot, error) {
-	return m.db.GetSnapshot(blockHeight)
+func (m *Server) GetSnapshot(ctx context.Context, blockHeight uint64) (*snapshot.Snapshot, error) {
+	return m.db.GetSnapshot(ctx, blockHeight)
 }
 
-func (m *Server) LatestSnapshot() (*snapshot.Snapshot, error) {
-	return m.db.LatestSnapshot()
+func (m *Server) LatestSnapshot(ctx context.Context) (*snapshot.Snapshot, error) {
+	return m.db.LatestSnapshot(ctx)
 }
 
-func (m *Server) PendingSnapshot() (*snapshot.Snapshot, error) {
-	pending, err := m.batch.PendingSnapshot()
+func (m *Server) PendingSnapshot(ctx context.Context) (*snapshot.Snapshot, error) {
+	pending, err := m.batch.PendingSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if pending == nil {
-		return m.LatestSnapshot()
+		return m.LatestSnapshot(ctx)
 	}
 	return pending, nil
 }

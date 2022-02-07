@@ -96,9 +96,10 @@ func (v *Validator) removeOldStakers(ctx context.Context, dontRemoveSelf bool) (
 	if err != nil {
 		return nil, err
 	}
-	if dontRemoveSelf {
+	walletAddr := v.wallet.Address()
+	if dontRemoveSelf && walletAddr != nil {
 		for i, staker := range stakersToEliminate {
-			if staker == v.wallet.Address() {
+			if staker.ToEthAddress() == *walletAddr {
 				stakersToEliminate[i] = stakersToEliminate[len(stakersToEliminate)-1]
 				stakersToEliminate = stakersToEliminate[:len(stakersToEliminate)-1]
 				break
@@ -136,12 +137,13 @@ func (v *Validator) resolveNextNode(ctx context.Context, info *ethbridge.StakerI
 	}
 	switch confirmType {
 	case ethbridge.CONFIRM_TYPE_INVALID:
-		if info == nil || info.LatestStakedNode.Cmp(unresolvedNodeIndex) <= 0 {
+		addr := v.wallet.Address()
+		if info == nil || addr == nil || info.LatestStakedNode.Cmp(unresolvedNodeIndex) <= 0 {
 			// We aren't an example of someone staked on a competitor
 			return nil
 		}
 		logger.Info().Int("node", int(unresolvedNodeIndex.Int64())).Msg("Rejecting node")
-		return v.rollup.RejectNextNode(ctx, v.wallet.Address())
+		return v.rollup.RejectNextNode(ctx, *addr)
 	case ethbridge.CONFIRM_TYPE_VALID:
 		nodeInfo, err := v.rollup.RollupWatcher.LookupNode(ctx, unresolvedNodeIndex)
 		if err != nil {
@@ -293,7 +295,7 @@ func (v *Validator) generateNodeAction(ctx context.Context, stakerInfo *OurStake
 	var correctNode nodeAction
 	wrongNodesExist := false
 	if len(successorNodes) > 0 {
-		logger.Info().Int("count", len(successorNodes)).Msg("Examining existing potential successors")
+		logger.Info().Int("count", len(successorNodes)).Msg("examining existing potential successors")
 	}
 	for nodeI, nd := range successorNodes {
 		if correctNode != nil && wrongNodesExist {
@@ -321,7 +323,7 @@ func (v *Validator) generateNodeAction(ctx context.Context, stakerInfo *OurStake
 				return nil, false, err
 			}
 			if valid {
-				logger.Info().Int("node", int((*big.Int)(nd.NodeNum).Int64())).Msg("Found correct node")
+				logger.Info().Int("node", int((*big.Int)(nd.NodeNum).Int64())).Msg("found correct node")
 				correctNode = existingNodeAction{
 					number: nd.NodeNum,
 					hash:   nd.NodeHash,
@@ -336,10 +338,10 @@ func (v *Validator) generateNodeAction(ctx context.Context, stakerInfo *OurStake
 				}
 				continue
 			} else {
-				logger.Warn().Int("node", int((*big.Int)(nd.NodeNum).Int64())).Msg("Found node with incorrect assertion")
+				logger.Warn().Int("node", int((*big.Int)(nd.NodeNum).Int64())).Msg("found node with incorrect assertion")
 			}
 		} else {
-			logger.Warn().Int("node", int((*big.Int)(nd.NodeNum).Int64())).Msg("Found younger sibling to correct node")
+			logger.Warn().Int("node", int((*big.Int)(nd.NodeNum).Int64())).Msg("found younger sibling to correct node")
 		}
 		// If we've hit this point, the node is "wrong"
 		wrongNodesExist = true
@@ -478,7 +480,7 @@ func lookupNodeStartState(ctx context.Context, rollup *ethbridge.RollupWatcher, 
 		return nil, err
 	}
 	if node.NodeHash != nodeHash {
-		return nil, errors.New("Looked up starting node but found wrong hash")
+		return nil, errors.New("looked up starting node but found wrong hash")
 	}
 	return node.AfterState(), nil
 }

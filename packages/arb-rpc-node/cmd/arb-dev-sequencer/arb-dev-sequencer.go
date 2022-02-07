@@ -250,7 +250,16 @@ func startup() error {
 	dummySequencerFeed := make(chan broadcaster.BroadcastFeedMessage)
 	var inboxReader *monitor.InboxReader
 	for {
-		inboxReader, err = mon.StartInboxReader(ctx, ethclint, rollupAddress, 0, bridgeUtilsAddress, nil, dummySequencerFeed, false)
+		inboxReader, err = mon.StartInboxReader(
+			ctx,
+			ethclint,
+			rollupAddress,
+			0,
+			bridgeUtilsAddress,
+			nil,
+			dummySequencerFeed,
+			config.Node.InboxReader,
+		)
 		if err == nil {
 			break
 		}
@@ -355,7 +364,7 @@ func startup() error {
 		return err
 	}
 
-	web3Server, err := web3.GenerateWeb3Server(srv, nil, web3.NormalMode, nil, inboxReader)
+	web3Server, err := web3.GenerateWeb3Server(srv, nil, web3.DefaultConfig, nil, inboxReader)
 	if err != nil {
 		return err
 	}
